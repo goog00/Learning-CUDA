@@ -52,6 +52,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 // 线程块大小常量
 constexpr int FA_BLOCK_SIZE = 256;  // 每个 block 的线程数
+constexpr int WARP_SIZE = 32;       // warp 大小
 
 /**
  * @brief 类型转换辅助函数：将输入类型转换为 float
@@ -60,6 +61,31 @@ constexpr int FA_BLOCK_SIZE = 256;  // 每个 block 的线程数
  */
 __device__ __forceinline__ float toFloat(float x) { return x; }
 __device__ __forceinline__ float toFloat(half x) { return __half2float(x); }
+
+/**
+ * @brief Warp 级别的规约求最大值（使用 shuffle 指令）
+ * @param val 当前线程的值
+ * @return warp 内的最大值
+ */
+__device__ __forceinline__ float warpReduceMax(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        val = fmaxf(val, other);
+    }
+    return val;
+}
+
+/**
+ * @brief Warp 级别的规约求和（使用 shuffle 指令）
+ * @param val 当前线程的值
+ * @return warp 内的和
+ */
+__device__ __forceinline__ float warpReduceSum(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
 
 /**
  * @brief 类型转换辅助函数：将 float 转换为目标类型
@@ -76,20 +102,22 @@ template <>
 __device__ __forceinline__ half fromFloat<half>(float x) { return __float2half(x); }
 
 /**
- * @brief Flash Attention 核函数
+ * @brief Flash Attention 优化核函数
  * 
- * 每个 block 处理一个 (batch, head, query_pos) 位置的注意力计算
+ * 优化点：
+ * 1. 使用 float 替代 double，提升性能（GPU 上 float 比 double 快约 32 倍）
+ * 2. 使用 warp shuffle 指令优化规约操作，减少共享内存使用和同步开销
+ * 3. 移除 Kahan 求和，简化计算（对于 float 精度通常足够）
+ * 4. 优化共享内存布局，减少占用
+ * 5. 改进内存访问模式
  * 
  * 算法流程：
  * 1. 加载当前 Query 向量到共享内存
  * 2. 计算与所有 Key 的点积，得到注意力分数
  * 3. 应用因果掩码（如果需要）
- * 4. 使用稳定的 softmax 算法计算注意力权重
+ * 4. 使用稳定的 softmax 算法计算注意力权重（warp 级规约）
  * 5. 计算 attention * V 得到输出
  * 
- 数值精度优化：
-  * - 使用 double 类型进行所有中间计算
- * - 使用 Kahan 求和算法进行累加，减少浮点误差
  * @tparam T 数据类型（float 或 half）
  * @param q Query 张量，设备端指针
  * @param k Key 张量，设备端指针
@@ -106,6 +134,180 @@ __device__ __forceinline__ half fromFloat<half>(float x) { return __float2half(x
  * @param is_causal 是否应用因果掩码
  */
 template <typename T>
+__global__ void flashAttentionOptimizedKernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    T* __restrict__ o,
+    int batch_size,
+    int target_seq_len,
+    int src_seq_len,
+    int query_heads,
+    int kv_heads,
+    int head_dim,
+    int heads_per_group,
+    float scale,
+    bool is_causal) {
+    
+    // 每个 block 处理一个 (batch, head, query_pos) 位置的组合
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int query_pos = blockIdx.z;
+    int tid = threadIdx.x;
+    int lane_id = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    
+    // 边界检查
+    if (batch_idx >= batch_size || head_idx >= query_heads || query_pos >= target_seq_len) {
+        return;
+    }
+    
+    // GQA 支持：计算对应的 KV 头索引
+    int kv_head_idx = head_idx / heads_per_group;
+    
+    // 计算输入张量的基地址偏移
+    // Q: [batch_size, target_seq_len, query_heads, head_dim]
+    int q_base = batch_idx * target_seq_len * query_heads * head_dim
+               + query_pos * query_heads * head_dim
+               + head_idx * head_dim;
+    
+    // K/V: [batch_size, src_seq_len, kv_heads, head_dim]
+    int kv_base = batch_idx * src_seq_len * kv_heads * head_dim
+                + kv_head_idx * head_dim;
+    
+    // O: [batch_size, target_seq_len, query_heads, head_dim]
+    int o_base = batch_idx * target_seq_len * query_heads * head_dim
+               + query_pos * query_heads * head_dim
+               + head_idx * head_dim;
+    
+    // 分配共享内存（使用 float 而非 double）
+    // s_q: [head_dim] - 当前 Query 向量
+    // s_scores: [src_seq_len] - 注意力分数
+    extern __shared__ char shared_mem[];
+    float* s_q = (float*)shared_mem;
+    float* s_scores = s_q + head_dim;
+    
+    // 加载 Query 向量到共享内存
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        s_q[i] = toFloat(q[q_base + i]);
+    }
+    __syncthreads();
+    
+    // ========================================
+    // 第一阶段：计算所有注意力分数 Q*K^T
+    // ========================================
+    float local_max = -FLT_MAX;
+    
+    for (int kv_pos = tid; kv_pos < src_seq_len; kv_pos += blockDim.x) {
+        // 因果掩码检查：只关注当前位置及之前的位置
+        if (is_causal && kv_pos > query_pos) {
+            s_scores[kv_pos] = -FLT_MAX;
+        } else {
+            // 计算 Q * K^T 的点积
+            float score = 0.0f;
+            int k_offset = kv_base + kv_pos * kv_heads * head_dim;
+            
+            // 点积计算（移除 Kahan 求和以提升性能）
+            for (int d = 0; d < head_dim; d++) {
+                score += s_q[d] * toFloat(k[k_offset + d]);
+            }
+            
+            // 应用缩放因子 scale = 1/sqrt(head_dim)
+            s_scores[kv_pos] = score * scale;
+        }
+        
+        // 更新局部最大值（用于数值稳定的 softmax）
+        local_max = fmaxf(local_max, s_scores[kv_pos]);
+    }
+    
+    // ========================================
+    // 规约找全局最大值（使用 warp shuffle 优化）
+    // ========================================
+    // Warp 内规约
+    float warp_max = warpReduceMax(local_max);
+    
+    // 每个 warp 的第一个线程写入共享内存
+    __shared__ float s_warp_max[FA_BLOCK_SIZE / WARP_SIZE];
+    if (lane_id == 0) {
+        s_warp_max[warp_id] = warp_max;
+    }
+    __syncthreads();
+    
+    // 第一个 warp 完成最终规约
+    float global_max = -FLT_MAX;
+    if (warp_id == 0) {
+        float val = (tid < num_warps) ? s_warp_max[tid] : -FLT_MAX;
+        val = warpReduceMax(val);
+        if (tid == 0) {
+            s_warp_max[0] = val;
+        }
+    }
+    __syncthreads();
+    global_max = s_warp_max[0];
+    
+    // ========================================
+    // 第二阶段：计算 softmax 分母（指数和）
+    // ========================================
+    float local_sum = 0.0f;
+    
+    for (int kv_pos = tid; kv_pos < src_seq_len; kv_pos += blockDim.x) {
+        // 只处理有效的分数（非掩码位置）
+        if (s_scores[kv_pos] > -FLT_MAX / 2) {
+            s_scores[kv_pos] = expf(s_scores[kv_pos] - global_max);
+            local_sum += s_scores[kv_pos];
+        } else {
+            s_scores[kv_pos] = 0.0f;
+        }
+    }
+    
+    // 规约求和（使用 warp shuffle 优化）
+    float warp_sum = warpReduceSum(local_sum);
+    
+    __shared__ float s_warp_sum[FA_BLOCK_SIZE / WARP_SIZE];
+    if (lane_id == 0) {
+        s_warp_sum[warp_id] = warp_sum;
+    }
+    __syncthreads();
+    
+    float global_sum = 0.0f;
+    if (warp_id == 0) {
+        float val = (tid < num_warps) ? s_warp_sum[tid] : 0.0f;
+        val = warpReduceSum(val);
+        if (tid == 0) {
+            s_warp_sum[0] = val;
+        }
+    }
+    __syncthreads();
+    global_sum = s_warp_sum[0];
+    
+    // 归一化注意力权重
+    float inv_sum = (global_sum > 0) ? (1.0f / global_sum) : 0.0f;
+    for (int kv_pos = tid; kv_pos < src_seq_len; kv_pos += blockDim.x) {
+        s_scores[kv_pos] *= inv_sum;
+    }
+    __syncthreads();
+    
+    // ========================================
+    // 第三阶段：计算 Attention * V
+    // ========================================
+    // 每个线程计算输出的一部分维度
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        
+        // 累加所有 KV 位置的加权 Value
+        for (int kv_pos = 0; kv_pos < src_seq_len; kv_pos++) {
+            int v_offset = kv_base + kv_pos * kv_heads * head_dim + d;
+            acc += s_scores[kv_pos] * toFloat(v[v_offset]);
+        }
+        
+        // 写入输出
+        o[o_base + d] = fromFloat<T>(acc);
+    }
+}
+
+// 保留原始实现作为参考
+template <typename T>
 __global__ void flashAttentionSimpleKernel(
     const T* __restrict__ q,
     const T* __restrict__ k,
@@ -118,7 +320,7 @@ __global__ void flashAttentionSimpleKernel(
     int kv_heads,
     int head_dim,
     int heads_per_group,
-    double scale,
+    float scale,
     bool is_causal) {
     
     // 每个 block 处理一个 (batch, head, query_pos) 位置的组合
@@ -152,40 +354,34 @@ __global__ void flashAttentionSimpleKernel(
                + head_idx * head_dim;
     
     // 分配共享内存
-    // s_q: [head_dim] - 当前 Query 向量（使用 double 提高精度）
-    // s_scores: [src_seq_len] - 注意力分数（使用 double 提高精度）
+    // s_q: [head_dim] - 当前 Query 向量（使用 float）
+    // s_scores: [src_seq_len] - 注意力分数（使用 float）
     extern __shared__ char shared_mem[];
-    double* s_q = (double*)shared_mem;
-    double* s_scores = s_q + head_dim;
+    float* s_q = (float*)shared_mem;
+    float* s_scores = s_q + head_dim;
     
     // 加载 Query 向量到共享内存
     for (int i = tid; i < head_dim; i += blockDim.x) {
-          s_q[i] = static_cast<double>(toFloat(q[q_base + i]));
+          s_q[i] = toFloat(q[q_base + i]);
     }
     __syncthreads();
     
     // ========================================
     // 第一阶段：计算所有注意力分数 Q*K^T
     // ========================================
-    double local_max = -DBL_MAX;
+    float local_max = -FLT_MAX;
     
     for (int kv_pos = tid; kv_pos < src_seq_len; kv_pos += blockDim.x) {
         // 因果掩码检查：只关注当前位置及之前的位置
         if (is_causal && kv_pos > query_pos) {
-            s_scores[kv_pos] = -DBL_MAX;
+            s_scores[kv_pos] = -FLT_MAX;
         } else {
             // 计算 Q * K^T 的点积
-            double score = 0.0;
-            double comp = 0.0;  // Kahan 补偿项
+            float score = 0.0f;
             int k_offset = kv_base + kv_pos * kv_heads * head_dim;
             
             for (int d = 0; d < head_dim; d++) {
-                double prod = s_q[d] * static_cast<double>(toFloat(k[k_offset + d]));
-                volatile double y = prod - comp;
-                volatile double t = score + y;
-                volatile double c = (t - score) - y;
-                comp = c;
-                score = t;
+                score += s_q[d] * toFloat(k[k_offset + d]);
             }
             
             // 应用缩放因子 scale = 1/sqrt(head_dim)
@@ -202,7 +398,7 @@ __global__ void flashAttentionSimpleKernel(
     // ========================================
     // 规约找全局最大值
     // ========================================
-    __shared__ double s_max[FA_BLOCK_SIZE];
+    __shared__ float s_max[FA_BLOCK_SIZE];
     if (tid < FA_BLOCK_SIZE) {
         s_max[tid] = local_max;
     }
@@ -218,33 +414,27 @@ __global__ void flashAttentionSimpleKernel(
         __syncthreads();
     }
     
-    double global_max = s_max[0];
+    float global_max = s_max[0];
     __syncthreads();
     
     // ========================================
     // 第二阶段：计算 softmax 分母（指数和）
     // ========================================
-    double local_sum = 0.0;
-    double comp_sum = 0.0;  // Kahan 补偿项
+    float local_sum = 0.0f;
 
     for (int kv_pos = tid; kv_pos < src_seq_len; kv_pos += blockDim.x) {
         // 只处理有效的分数（非掩码位置）
-        if (s_scores[kv_pos] > -DBL_MAX / 2) {
-            s_scores[kv_pos] = exp(s_scores[kv_pos] - global_max);
-            // Kahan 求和
-            volatile double y = s_scores[kv_pos] - comp_sum;
-            volatile double t = local_sum + y;
-            volatile double c = (t - local_sum) - y;
-            comp_sum = c;
-            local_sum = t;
+        if (s_scores[kv_pos] > -FLT_MAX / 2) {
+            s_scores[kv_pos] = expf(s_scores[kv_pos] - global_max);
+            local_sum += s_scores[kv_pos];
         } else {
-            s_scores[kv_pos] = 0.0;
+            s_scores[kv_pos] = 0.0f;
         }
     }
     __syncthreads();
     
     // 规约求和
-    __shared__ double s_sum[FA_BLOCK_SIZE];
+    __shared__ float s_sum[FA_BLOCK_SIZE];
     if (tid < FA_BLOCK_SIZE) {
         s_sum[tid] = local_sum;
     }
@@ -257,7 +447,7 @@ __global__ void flashAttentionSimpleKernel(
         __syncthreads();
     }
     
-    double global_sum = s_sum[0];
+    float global_sum = s_sum[0];
     __syncthreads();
     
     // 归一化注意力权重
@@ -270,26 +460,19 @@ __global__ void flashAttentionSimpleKernel(
     
     // ========================================
     // 第三阶段：计算 Attention * V
-    //使用 Kahan 求和算法累加提高精度
     // ========================================
     // 每个线程计算输出的一部分维度
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        double acc = 0.0;
-        double comp = 0.0;  // Kahan 补偿项
+        float acc = 0.0f;
         
         // 累加所有 KV 位置的加权 Value
         for (int kv_pos = 0; kv_pos < src_seq_len; kv_pos++) {
             int v_offset = kv_base + kv_pos * kv_heads * head_dim + d;
-            double prod = s_scores[kv_pos] * static_cast<double>(toFloat(v[v_offset]));
-            volatile double y = prod - comp;
-            volatile double t = acc + y;
-            volatile double c = (t - acc) - y;
-            comp = c;
-            acc = t;
+            acc += s_scores[kv_pos] * toFloat(v[v_offset]);
         }
         
         // 写入输出
-       o[o_base + d] = fromFloat<T>(static_cast<float>(acc));
+       o[o_base + d] = fromFloat<T>(acc);
     }
 }
 
@@ -382,7 +565,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         // 计算核函数参数
         // ========================================
         // scale = 1 / sqrt(head_dim)
-        double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         
         // 计算每组中 Query 头的数量（用于 GQA）
         int heads_per_group = query_heads / kv_heads;
@@ -399,10 +582,10 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         dim3 grid(batch_size, query_heads, target_seq_len);
         int block_size = FA_BLOCK_SIZE;
         
-        // 计算共享内存大小 使用 double 类型提高精度）
-        // s_q: head_dim * sizeof(double)
-        // s_scores: src_seq_len * sizeof(double)
-        size_t shared_mem_size = (head_dim + src_seq_len) * sizeof(double);
+        // 计算共享内存大小（使用 float 类型）
+        // s_q: head_dim * sizeof(float)
+        // s_scores: src_seq_len * sizeof(float)
+        size_t shared_mem_size = (head_dim + src_seq_len) * sizeof(float);
         
         // 检查共享内存是否超过设备限制（A100 每个 SM 最大 164KB）
         // 这里使用保守的 48KB 限制，适用于大多数 GPU
@@ -412,9 +595,9 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         }
         
         // ========================================
-        // 启动核函数
+        // 启动优化核函数
         // ========================================
-        flashAttentionSimpleKernel<T><<<grid, block_size, shared_mem_size>>>(
+        flashAttentionOptimizedKernel<T><<<grid, block_size, shared_mem_size>>>(
             d_q, d_k, d_v, d_o,
             batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads, head_dim,
